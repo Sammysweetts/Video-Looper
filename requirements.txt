@@ -1,0 +1,2 @@
+streamlit>=1.31
+imageio-ffmpeg>=0.4.9
