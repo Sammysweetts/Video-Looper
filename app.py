@@ -11,7 +11,6 @@ st.set_page_config(page_title="Video Looper (No Re-encode)", layout="centered")
 
 
 def ffmpeg_exe() -> str:
-    # imageio-ffmpeg provides a usable ffmpeg binary on Streamlit Cloud.
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
@@ -21,7 +20,6 @@ def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
 
 
 def parse_duration_seconds(ffmpeg_stderr: str) -> float | None:
-    # Example: Duration: 00:01:23.45,
     m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?),", ffmpeg_stderr)
     if not m:
         return None
@@ -30,10 +28,9 @@ def parse_duration_seconds(ffmpeg_stderr: str) -> float | None:
 
 
 def get_duration_seconds(in_path: str) -> float | None:
-    # ffmpeg prints duration to stderr; return code is typically non-zero for probe-only runs.
     cmd = [ffmpeg_exe(), "-hide_banner", "-i", in_path]
     rc, out, err = run_cmd(cmd)
-    _ = (rc, out)  # unused
+    _ = (rc, out)
     return parse_duration_seconds(err)
 
 
@@ -43,16 +40,43 @@ def human_mb(n: int) -> str:
 
 def fmt_time(t: float) -> str:
     if t < 0:
-        t = 0
+        t = 0.0
     hh = int(t // 3600)
     mm = int((t % 3600) // 60)
     ss = t % 60
     return f"{hh:02d}:{mm:02d}:{ss:06.3f}"
 
 
+def parse_timecode_to_seconds(tc: str) -> float:
+    """
+    Accepts:
+      - SS[.ms]
+      - MM:SS[.ms]
+      - HH:MM:SS[.ms]
+    """
+    s = tc.strip()
+    if not s:
+        raise ValueError("Empty timestamp")
+
+    parts = s.split(":")
+    if len(parts) == 1:
+        return float(parts[0])
+    if len(parts) == 2:
+        mm = int(parts[0])
+        ss = float(parts[1])
+        return mm * 60 + ss
+    if len(parts) == 3:
+        hh = int(parts[0])
+        mm = int(parts[1])
+        ss = float(parts[2])
+        return hh * 3600 + mm * 60 + ss
+
+    raise ValueError("Invalid timestamp format")
+
+
 def trim_video_stream_copy(in_path: str, out_path: str, start_s: float, end_s: float) -> None:
     """
-    Trim a portion without re-encoding (-c copy).
+    Trim without re-encoding (-c copy).
     Note: With stream-copy, cut points may align to nearest keyframes. Preview shows the actual result.
     """
     if end_s <= start_s:
@@ -64,37 +88,28 @@ def trim_video_stream_copy(in_path: str, out_path: str, start_s: float, end_s: f
         "-hide_banner",
         "-loglevel",
         "error",
-        # Seek + trim
         "-ss",
         f"{start_s:.6f}",
         "-to",
         f"{end_s:.6f}",
         "-i",
         in_path,
-        # Stream copy to preserve original quality and fps
         "-c",
         "copy",
-        # Safer timestamps for later concatenation
         "-fflags",
         "+genpts",
         "-avoid_negative_ts",
         "make_zero",
-        # Faster web preview
         "-movflags",
         "+faststart",
         out_path,
     ]
-
     rc, _, err = run_cmd(cmd)
     if rc != 0:
         raise RuntimeError(err.strip() or "ffmpeg trim failed.")
 
 
 def loop_video_stream_copy_concat_demuxer(in_path: str, out_path: str, loops: int) -> None:
-    """
-    Loop by concatenating the same file N times using concat demuxer with stream copy.
-    This keeps encoded audio/video exactly (no re-encode), preserving quality and fps.
-    """
     if loops < 1:
         raise ValueError("loops must be >= 1")
 
@@ -136,9 +151,6 @@ def loop_video_stream_copy_concat_demuxer(in_path: str, out_path: str, loops: in
 
 
 def loop_video_stream_copy_ts_fallback(in_path: str, out_path: str, loops: int) -> None:
-    """
-    Fallback method (still no re-encode) using MPEG-TS intermediate.
-    """
     if loops < 1:
         raise ValueError("loops must be >= 1")
 
@@ -202,6 +214,18 @@ def loop_video_no_reencode(in_path: str, out_path: str, loops: int) -> None:
             )
 
 
+def validate_range(start_s: float, end_s: float, duration: float) -> tuple[float, float]:
+    if start_s < 0 or end_s < 0:
+        raise ValueError("Timestamps must be >= 0.")
+    if end_s <= start_s:
+        raise ValueError("End time must be greater than start time.")
+    if start_s > duration:
+        raise ValueError("Start time is beyond video duration.")
+    if end_s > duration:
+        raise ValueError("End time is beyond video duration.")
+    return start_s, end_s
+
+
 # ---------------- UI ----------------
 
 st.title("Video Looper (original quality, original FPS)")
@@ -219,106 +243,187 @@ loops = st.number_input(
     help="Output duration and file size grow ~linearly with X.",
 )
 
+# State
 if "trim_preview_bytes" not in st.session_state:
     st.session_state.trim_preview_bytes = None
 if "trim_range" not in st.session_state:
     st.session_state.trim_range = None
+if "file_sig" not in st.session_state:
+    st.session_state.file_sig = None
 
-if uploaded is not None:
-    st.subheader("Preview (original)")
-    original_bytes = uploaded.getvalue()
-    st.video(original_bytes)
-    st.write(f"Uploaded size: **{human_mb(len(original_bytes))}**")
+if uploaded is None:
+    st.stop()
 
-    # Save input once to temp to probe duration and reuse
-    with tempfile.TemporaryDirectory() as td_probe:
-        td_probe = Path(td_probe)
-        in_name = Path(uploaded.name).name
-        in_path = td_probe / in_name
-        in_path.write_bytes(original_bytes)
+original_bytes = uploaded.getvalue()
+file_sig = (uploaded.name, len(original_bytes))
 
-        duration = get_duration_seconds(str(in_path))
+# Reset selection/preview when a different file is uploaded
+if st.session_state.file_sig != file_sig:
+    st.session_state.file_sig = file_sig
+    st.session_state.trim_preview_bytes = None
+    st.session_state.trim_range = None
+    # (Re)initialize these later once we know duration
+    for k in ["range_slider", "start_tc", "end_tc", "start_s", "end_s"]:
+        if k in st.session_state:
+            del st.session_state[k]
 
-    if duration is None:
-        st.error("Could not read video duration. Please try a different file.")
-        st.stop()
+st.subheader("Preview (original)")
+st.video(original_bytes)
+st.write(f"Uploaded size: **{human_mb(len(original_bytes))}**")
 
-    st.subheader("Select timestamp range to loop")
-    default_end = min(duration, 5.0)
-    start_s, end_s = st.slider(
-        "Range (seconds)",
-        min_value=0.0,
-        max_value=float(duration),
-        value=(0.0, float(default_end)),
-        step=0.1,
-        help="Select the portion that will be looped.",
+# Probe duration (needs a file)
+with tempfile.TemporaryDirectory() as td_probe:
+    td_probe = Path(td_probe)
+    in_name = Path(uploaded.name).name
+    in_path = td_probe / in_name
+    in_path.write_bytes(original_bytes)
+    duration = get_duration_seconds(str(in_path))
+
+if duration is None:
+    st.error("Could not read video duration. Please try a different file.")
+    st.stop()
+
+st.subheader("Select timestamp range to loop")
+
+# Initialize default range once per file
+if "range_slider" not in st.session_state:
+    default_end = min(float(duration), 5.0)
+    st.session_state.range_slider = (0.0, float(default_end))
+    st.session_state.start_s = 0.0
+    st.session_state.end_s = float(default_end)
+    st.session_state.start_tc = fmt_time(0.0)
+    st.session_state.end_tc = fmt_time(float(default_end))
+
+# Slider (coarse)
+slider_start, slider_end = st.slider(
+    "Range (seconds) — slider (coarse)",
+    min_value=0.0,
+    max_value=float(duration),
+    value=st.session_state.range_slider,
+    step=0.1,
+    key="range_slider",
+    help="Use the slider for rough selection, then fine-tune using timestamp inputs below.",
+)
+
+# Keep state in sync after slider movement
+st.session_state.start_s = float(slider_start)
+st.session_state.end_s = float(slider_end)
+st.session_state.start_tc = fmt_time(st.session_state.start_s)
+st.session_state.end_tc = fmt_time(st.session_state.end_s)
+
+# Timestamp inputs (fine)
+col_ts1, col_ts2, col_ts3 = st.columns([1, 1, 0.8])
+with col_ts1:
+    st.text_input(
+        "Start timestamp (HH:MM:SS.mmm or MM:SS.mmm or SS.mmm)",
+        key="start_tc",
     )
-    st.write(f"Selected: **{fmt_time(start_s)} → {fmt_time(end_s)}** (length: **{end_s - start_s:.3f}s**)")
+with col_ts2:
+    st.text_input(
+        "End timestamp (HH:MM:SS.mmm or MM:SS.mmm or SS.mmm)",
+        key="end_tc",
+    )
+with col_ts3:
+    apply_ts = st.button("Apply timestamps", type="secondary")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        preview_btn = st.button("Preview selected portion", type="secondary")
-    with col2:
-        process_btn = st.button("Create looped video", type="primary")
+# Apply typed timestamps -> update slider + selection state
+if apply_ts:
+    try:
+        start_s = parse_timecode_to_seconds(st.session_state.start_tc)
+        end_s = parse_timecode_to_seconds(st.session_state.end_tc)
+        start_s, end_s = validate_range(start_s, end_s, float(duration))
 
-    def build_trim_preview_bytes() -> bytes:
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            in_name2 = Path(uploaded.name).name
-            in_path2 = td / in_name2
-            in_path2.write_bytes(original_bytes)
+        # Update slider + internal seconds state
+        st.session_state.range_slider = (float(start_s), float(end_s))
+        st.session_state.start_s = float(start_s)
+        st.session_state.end_s = float(end_s)
 
-            trim_path = td / f"{Path(in_name2).stem}_trim.mp4"
-            trim_video_stream_copy(str(in_path2), str(trim_path), float(start_s), float(end_s))
-            return trim_path.read_bytes()
+        # Invalidate cached preview if range changed
+        st.session_state.trim_preview_bytes = None
+        st.session_state.trim_range = None
 
-    if preview_btn:
-        with st.spinner("Creating preview (no re-encode)…"):
-            trim_bytes = build_trim_preview_bytes()
-        st.session_state.trim_preview_bytes = trim_bytes
-        st.session_state.trim_range = (float(start_s), float(end_s))
+        st.rerun()
+    except Exception as e:
+        st.error(f"Invalid timestamps: {e}")
 
-    if st.session_state.trim_preview_bytes is not None:
-        st.subheader("Preview (selected portion)")
-        st.video(st.session_state.trim_preview_bytes)
+# Show selected info (based on current state)
+try:
+    validate_range(st.session_state.start_s, st.session_state.end_s, float(duration))
+    st.write(
+        f"Selected: **{fmt_time(st.session_state.start_s)} → {fmt_time(st.session_state.end_s)}** "
+        f"(length: **{(st.session_state.end_s - st.session_state.start_s):.3f}s**)"
+    )
+except Exception as e:
+    st.error(str(e))
+    st.stop()
 
-    if process_btn:
-        # Ensure we have a preview clip for the *current* selection; if not, create it.
-        current_range = (float(start_s), float(end_s))
-        if st.session_state.trim_preview_bytes is None or st.session_state.trim_range != current_range:
-            with st.spinner("Preparing selected portion (no re-encode)…"):
-                st.session_state.trim_preview_bytes = build_trim_preview_bytes()
-                st.session_state.trim_range = current_range
+col1, col2 = st.columns(2)
+with col1:
+    preview_btn = st.button("Preview selected portion", type="secondary")
+with col2:
+    process_btn = st.button("Create looped video", type="primary")
 
-        trim_bytes = st.session_state.trim_preview_bytes
 
-        out_name = f"{Path(uploaded.name).stem}_looped_{int(loops)}x.mp4"
+def build_trim_preview_bytes(start_s: float, end_s: float) -> bytes:
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        in_name2 = Path(uploaded.name).name
+        in_path2 = td / in_name2
+        in_path2.write_bytes(original_bytes)
 
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            clip_path = td / "selected_clip.mp4"
-            clip_path.write_bytes(trim_bytes)
+        trim_path = td / f"{Path(in_name2).stem}_trim.mp4"
+        trim_video_stream_copy(str(in_path2), str(trim_path), float(start_s), float(end_s))
+        return trim_path.read_bytes()
 
-            out_path = td / out_name
 
-            with st.spinner("Looping (no re-encode)…"):
-                loop_video_no_reencode(str(clip_path), str(out_path), int(loops))
+current_range = (float(st.session_state.start_s), float(st.session_state.end_s))
 
-            out_bytes = out_path.read_bytes()
+if preview_btn:
+    with st.spinner("Creating preview (no re-encode)…"):
+        trim_bytes = build_trim_preview_bytes(*current_range)
+    st.session_state.trim_preview_bytes = trim_bytes
+    st.session_state.trim_range = current_range
 
-        st.success("Done.")
+if st.session_state.trim_preview_bytes is not None:
+    st.subheader("Preview (selected portion)")
+    st.video(st.session_state.trim_preview_bytes)
 
-        st.subheader("Preview (looped output)")
-        st.video(out_bytes)
+if process_btn:
+    # Ensure preview clip exists for the current selection
+    if st.session_state.trim_preview_bytes is None or st.session_state.trim_range != current_range:
+        with st.spinner("Preparing selected portion (no re-encode)…"):
+            st.session_state.trim_preview_bytes = build_trim_preview_bytes(*current_range)
+            st.session_state.trim_range = current_range
 
-        st.write(f"Output size: **{human_mb(len(out_bytes))}**")
+    trim_bytes = st.session_state.trim_preview_bytes
 
-        st.download_button(
-            label="Download looped video",
-            data=out_bytes,
-            file_name=out_name,
-            mime="video/mp4",
-        )
+    out_name = f"{Path(uploaded.name).stem}_looped_{int(loops)}x.mp4"
+
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        clip_path = td / "selected_clip.mp4"
+        clip_path.write_bytes(trim_bytes)
+
+        out_path = td / out_name
+
+        with st.spinner("Looping (no re-encode)…"):
+            loop_video_no_reencode(str(clip_path), str(out_path), int(loops))
+
+        out_bytes = out_path.read_bytes()
+
+    st.success("Done.")
+
+    st.subheader("Preview (looped output)")
+    st.video(out_bytes)
+
+    st.write(f"Output size: **{human_mb(len(out_bytes))}**")
+
+    st.download_button(
+        label="Download looped video",
+        data=out_bytes,
+        file_name=out_name,
+        mime="video/mp4",
+    )
 
 st.divider()
 st.markdown(
@@ -326,7 +431,7 @@ st.markdown(
 #### Notes / constraints (important for “no quality loss”)
 - This app trims and loops using **stream copy** (no re-encode), preserving:
   1) **Original quality**  
-  2) **Original frame rate**  
+  2) **Original frame rate**
 - With stream-copy trimming, cut points may align to nearest keyframes; the **selected-portion preview shows the actual trimmed result**.
 - Very large **X** will produce very large outputs and may exceed Streamlit Cloud resource limits.
 """
