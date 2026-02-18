@@ -6,7 +6,7 @@ from pathlib import Path
 import streamlit as st
 import imageio_ffmpeg
 
-st.set_page_config(page_title="Video Looper (No Re-encode)", layout="centered")
+st.set_page_config(page_title="Video Looper (High Precision)", layout="centered")
 
 
 def ffmpeg_exe() -> str:
@@ -77,12 +77,14 @@ def get_duration_seconds_via_ffmpeg(in_path: str) -> float:
     return hh * 3600 + mm * 60 + ss
 
 
-def extract_clip_stream_copy(in_path: str, out_path: str, start_s: float, end_s: float) -> None:
+def extract_clip_precise(in_path: str, out_path: str, start_s: float, end_s: float) -> None:
     """
-    Extract [start_s, end_s] without re-encoding (stream copy).
-
-    NOTE: With -c copy, cuts are typically keyframe-aligned (not frame-accurate) depending
-    on the source. This preserves original quality + fps (no re-encode).
+    Extract [start_s, end_s] with frame-accurate precision.
+    
+    To ensure NO DELAY and PRECISE TIMING, we must re-encode the clip 
+    (stream copy cannot cut between keyframes).
+    
+    We use CRF 17 (Visually Lossless) to maintain "Original Video Quality".
     """
     if end_s <= start_s:
         raise ValueError("End time must be greater than start time.")
@@ -95,19 +97,30 @@ def extract_clip_stream_copy(in_path: str, out_path: str, start_s: float, end_s:
         "-hide_banner",
         "-loglevel",
         "error",
-        # Fast seek (keyframe aligned) while preserving stream copy
+        # Fast seek to approx location
         "-ss",
         f"{start_s:.6f}",
         "-i",
         in_path,
+        # Exact duration
         "-t",
         f"{dur:.6f}",
-        "-c",
-        "copy",
-        # Helps players start quickly
+        # VIDEO: Use H.264 at CRF 17 (Visually Lossless) for frame precision + quality
+        "-c:v",
+        "libx264",
+        "-crf",
+        "17",
+        "-preset",
+        "veryfast",
+        # AUDIO: Re-encode AAC high bitrate to ensure audio cuts matches video exactly
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        # Flags for web optimization
         "-movflags",
         "+faststart",
-        # Avoid negative timestamps in some sources
+        # Avoid negative timestamps
         "-avoid_negative_ts",
         "make_zero",
         out_path,
@@ -120,7 +133,7 @@ def extract_clip_stream_copy(in_path: str, out_path: str, start_s: float, end_s:
 def loop_video_stream_copy_concat_demuxer(in_path: str, out_path: str, loops: int) -> None:
     """
     Loop by concatenating the same file N times using concat demuxer with stream copy.
-    This keeps original encoded video/audio exactly (no re-encode), preserving quality and fps.
+    This keeps the encoded video/audio exactly (no re-encode), preserving quality and fps.
     """
     if loops < 1:
         raise ValueError("loops must be >= 1")
@@ -218,7 +231,7 @@ def loop_video_stream_copy_ts_fallback(in_path: str, out_path: str, loops: int) 
             raise RuntimeError(err2.strip() or "ffmpeg TS concat step failed.")
 
 
-def loop_video_no_reencode(in_path: str, out_path: str, loops: int) -> None:
+def loop_video_pipeline(in_path: str, out_path: str, loops: int) -> None:
     """Try best no-reencode approach first; if it fails, attempt a fallback method."""
     try:
         loop_video_stream_copy_concat_demuxer(in_path, out_path, loops)
@@ -227,18 +240,17 @@ def loop_video_no_reencode(in_path: str, out_path: str, loops: int) -> None:
             loop_video_stream_copy_ts_fallback(in_path, out_path, loops)
         except Exception as e2:
             raise RuntimeError(
-                "Could not loop the video with stream-copy (no re-encode).\n\n"
-                "This usually happens if the container/codec parameters cannot be concatenated safely.\n\n"
+                "Could not loop the video.\n\n"
                 f"First attempt error:\n{e1}\n\nFallback attempt error:\n{e2}"
             )
 
 
 # ---------------- UI ----------------
 
-st.title("Video Looper (original quality, original FPS)")
+st.title("Video Looper (Precise Cut, Original Quality)")
 st.caption(
-    "Loop a **selected portion** of your video **without re-encoding** (`ffmpeg -c copy`). "
-    "That preserves **original quality** and **original frame rate**."
+    "Loop a **selected portion** of your video with **frame precision**. "
+    "Uses visually lossless settings to maintain original quality."
 )
 
 uploaded = st.file_uploader("Upload a video file", type=None)
@@ -336,8 +348,7 @@ if uploaded is not None:
                 st.metric("Selection end", sec_to_timecode(st.session_state.range_end))
 
             st.caption(
-                "Preview + looping uses **stream copy** (no re-encode). "
-                "For many videos, cuts are **keyframe-aligned**, so the preview/output may start slightly earlier than the exact frame."
+                "Cutting is now **frame accurate**. This ensures no delay at the loop point."
             )
 
         # Preview selection
@@ -351,8 +362,8 @@ if uploaded is not None:
             clip_name = f"{stem}_clip_preview.mp4"
             clip_path = td / clip_name
             try:
-                with st.spinner("Building preview (no re-encode)…"):
-                    extract_clip_stream_copy(
+                with st.spinner("Building precise preview…"):
+                    extract_clip_precise(
                         str(in_path),
                         str(clip_path),
                         float(st.session_state.range_start),
@@ -372,16 +383,16 @@ if uploaded is not None:
             out_path = td / out_name
 
             try:
-                with st.spinner("Extracting selected portion (no re-encode)…"):
-                    extract_clip_stream_copy(
+                with st.spinner("Extracting selected portion (Frame Accurate)…"):
+                    extract_clip_precise(
                         str(in_path),
                         str(clip_path),
                         float(st.session_state.range_start),
                         float(st.session_state.range_end),
                     )
 
-                with st.spinner("Looping selection (no re-encode)…"):
-                    loop_video_no_reencode(str(clip_path), str(out_path), int(loops))
+                with st.spinner("Looping selection…"):
+                    loop_video_pipeline(str(clip_path), str(out_path), int(loops))
 
                 out_bytes = out_path.read_bytes()
 
@@ -403,12 +414,8 @@ if uploaded is not None:
 st.divider()
 st.markdown(
     """
-#### Notes / constraints (important for “no quality loss”)
-- This app loops videos using **stream copy** (no re-encode). That’s what preserves:
-  1) **Original quality**  
-  2) **Original frame rate**  
-- Range selection is also done with **stream copy**. For many codecs, **cuts are keyframe-aligned** (not frame-accurate) unless you re-encode.
-- Stream-copy concatenation can fail for some files (codec/container edge cases). The app tries a fallback, but **some inputs still cannot be concatenated without re-encoding**.
-- Very large **X** will produce very large outputs and may exceed Streamlit Cloud resource limits.
+#### Notes
+- This tool uses **Visually Lossless** settings (CRF 17) to ensure precise cutting without visible quality loss.
+- The looping itself is done via stream copy, so the video does not degrade further regardless of loop count.
 """
 )
